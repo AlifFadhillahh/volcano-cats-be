@@ -34,6 +34,10 @@ const LOBBY_TIMEOUT_MS = 30 * 60 * 1000; // 30 menit
 // Sekarang murni untuk logging/housekeeping (lihat markAsLongDisconnected) —
 // auto-play untuk pemain disconnected aktif SEGERA, tidak menunggu durasi ini.
 const RECONNECT_TIMEOUT_MS = 60 * 1000; // 1 menit
+// Batas waktu per giliran sebelum server otomatis draw-kan kartu untuk pemain
+// yang sedang giliran. Mencegah game macet kalau pemain berlama-lama tanpa
+// bertindak (lupa, ragu, atau memang sengaja menunda).
+const TURN_TIMEOUT_MS = 10 * 1000; // 10 detik
 
 export class VolcanoCatsRoom extends Room {
   private gameState!: GameState;
@@ -55,6 +59,11 @@ export class VolcanoCatsRoom extends Room {
   // window selesai di waktu yang berdekatan).
   private isAutoPlaying = false;
 
+  // Timer turn-timeout untuk giliran sekarang (kalau ada). Direset setiap kali
+  // giliran berganti (advance) atau pendingAction berubah, dan di-clear total
+  // kalau game berakhir / room dispose.
+  private turnTimer: { clear: () => void } | null = null;
+
   onCreate(_options: unknown) {
     this.maxClients = MAX_PLAYERS;
     this.autoDispose = true;
@@ -75,6 +84,7 @@ export class VolcanoCatsRoom extends Room {
       peekResult: null,
       winner: null,
       log: [],
+      turnEndsAt: null,
     };
 
     this.onMessage("*", (client, type, message) => {
@@ -173,7 +183,7 @@ export class VolcanoCatsRoom extends Room {
       // RECONNECT_TIMEOUT_MS) — kalau giliran sekarang kebetulan milik
       // pemain ini, jangan biarkan game macet menunggu mereka draw secara
       // manual yang tidak akan pernah terjadi.
-      this.triggerAutoPlayLoop();
+      this.refreshTurnState();
 
       // Timeout ini sekarang murni untuk housekeeping/logging — TIDAK lagi
       // mengeliminasi pemain (lihat markAsLongDisconnected). Reconnect tetap
@@ -191,6 +201,7 @@ export class VolcanoCatsRoom extends Room {
 
   onDispose() {
     this.clearFreezeWindowTimer();
+    this.clearTurnTimer();
     this.log.info("Room disposed");
   }
 
@@ -245,7 +256,7 @@ export class VolcanoCatsRoom extends Room {
 
     // connected sudah false (di-set sejak onLeave), tidak perlu diubah lagi.
     // Trigger auto-play loop kalau kebetulan giliran mereka sekarang.
-    this.triggerAutoPlayLoop();
+    this.refreshTurnState();
   }
 
   // ============================================================
@@ -330,9 +341,21 @@ export class VolcanoCatsRoom extends Room {
 
     this.gameState = setupGame(this.gameState);
     this.broadcastState();
+
+    // PENTING: kirim hand awal (7 kartu termasuk Water Bucket) ke SEMUA pemain.
+    // GAME_STATE_UPDATE sebenarnya sudah membawa hand masing-masing pemain
+    // (lihat serializeForClient), tapi frontend membaca hand HANYA dari pesan
+    // YOUR_HAND terpisah (lihat store: setMyHand cuma dipanggil di situ).
+    // Tanpa baris ini, hand pemain tampak kosong sampai mereka melakukan aksi
+    // pertama yang kebetulan trigger sendHandUpdate — padahal mereka harus
+    // sudah bisa lihat 7 kartu sejak giliran pertama dimulai.
+    for (const pid of this.gameState.turnOrder) {
+      this.sendHandUpdate(pid);
+    }
+
     this.log.info({ players: this.gameState.players.size }, "Game started");
 
-    this.triggerAutoPlayLoop();
+    this.refreshTurnState();
   }
 
   private handleToggleAway(client: Client, away: boolean) {
@@ -350,7 +373,9 @@ export class VolcanoCatsRoom extends Room {
     // mulai auto-play. Kalau away=false (kembali aktif) di tengah giliran
     // auto-play sendiri, loop berikutnya otomatis berhenti karena
     // shouldAutoPlay() akan return false begitu giliran ini selesai di-draw.
-    this.triggerAutoPlayLoop();
+    // Sebaliknya kalau away=false dan ternyata gilirannya sekarang, turn timer
+    // baru perlu dipasang (karena sebelumnya tidak aktif selama away=true).
+    this.refreshTurnState();
   }
 
   private handleDrawCard(client: Client) {
@@ -375,7 +400,7 @@ export class VolcanoCatsRoom extends Room {
       this.sendToClient(client, { type: "PEEK_RESULT", cards: this.gameState.peekResult.cards });
     }
 
-    this.triggerAutoPlayLoop();
+    this.refreshTurnState();
   }
 
   private handlePlayCard(client: Client, cardId: string, targetId?: string) {
@@ -461,7 +486,7 @@ export class VolcanoCatsRoom extends Room {
           }
         }
 
-        this.triggerAutoPlayLoop();
+        this.refreshTurnState();
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : "Unknown error";
         this.log.error({ err: message }, "Error resolving freeze window effect");
@@ -487,6 +512,21 @@ export class VolcanoCatsRoom extends Room {
   // resolve instan dalam satu frame.
   //
   // PENTING: method ini async tapi TIDAK di-await oleh caller (fire-and-forget)
+  // ============================================================
+  // REFRESH TURN STATE — dipanggil setiap kali giliran berpotensi berubah
+  // (setelah draw, play card, resolve pending action, dll). Menggabungkan
+  // dua mekanisme yang saling melengkapi:
+  //   1. triggerAutoPlayLoop()  → kalau giliran sekarang milik pemain
+  //      away/disconnected, auto-draw untuk mereka
+  //   2. scheduleTurnTimer()    → kalau giliran sekarang milik pemain aktif,
+  //      pasang timer 10 detik sebelum auto-draw paksa
+  // Kedua fungsi sudah saling menge-skip kondisi yang bukan tanggung jawabnya
+  // masing-masing, jadi aman dipanggil bersamaan tanpa konflik.
+  private refreshTurnState() {
+    this.triggerAutoPlayLoop();
+    this.scheduleTurnTimer();
+  }
+
   // karena handler Colyseus message tidak boleh blocking lama. Guard
   // `isAutoPlaying` mencegah overlap kalau dipanggil ulang sebelum loop
   // sebelumnya selesai.
@@ -538,6 +578,99 @@ export class VolcanoCatsRoom extends Room {
     });
   }
 
+  // ============================================================
+  // TURN TIMER — auto-draw kalau pemain tidak bertindak dalam TURN_TIMEOUT_MS
+  // ============================================================
+  // Dipanggil setiap kali giliran berganti atau pendingAction selesai/berubah.
+  // TIDAK dipasang untuk pemain away/disconnected — mereka sudah ditangani
+  // triggerAutoPlayLoop() secara terpisah dengan delay-nya sendiri; memasang
+  // dua timer sekaligus untuk kasus yang sama berisiko race condition
+  // (keduanya coba draw kartu yang sama).
+  private scheduleTurnTimer() {
+    this.clearTurnTimer();
+
+    if (this.gameState.status !== "playing") {
+      this.setTurnEndsAt(null);
+      return;
+    }
+    if (this.gameState.pendingAction) {
+      // Ada aksi lain yang sedang ditunggu (Bribe, Flood, AWAITING_FREEZE,
+      // dst) — jangan jalankan turn timer sampai itu selesai, supaya tidak
+      // ada dua mekanisme timeout yang tumpang tindih di waktu yang sama.
+      this.setTurnEndsAt(null);
+      return;
+    }
+
+    const current = getCurrentPlayer(this.gameState);
+    if (!current || current.away || !current.connected) {
+      // Auto-play loop yang akan menangani giliran ini, bukan turn timer.
+      this.setTurnEndsAt(null);
+      return;
+    }
+
+    const endsAt = Date.now() + TURN_TIMEOUT_MS;
+    this.setTurnEndsAt(endsAt);
+
+    this.turnTimer = this.clock.setTimeout(() => {
+      this.turnTimer = null;
+      this.handleTurnTimeout();
+    }, TURN_TIMEOUT_MS);
+  }
+
+  private clearTurnTimer() {
+    if (this.turnTimer) {
+      this.turnTimer.clear();
+      this.turnTimer = null;
+    }
+  }
+
+  private setTurnEndsAt(value: number | null) {
+    if (this.gameState.turnEndsAt !== value) {
+      this.gameState = { ...this.gameState, turnEndsAt: value };
+    }
+  }
+
+  // Dipanggil saat turn timer benar-benar habis tanpa aksi dari pemain.
+  // Perilaku: paksa draw kartu untuk pemain yang sedang giliran — sama
+  // seperti auto-play, ini pilihan paling aman/predictable (tidak pernah
+  // memainkan kartu strategis tanpa sepengetahuan pemain).
+  private handleTurnTimeout() {
+    if (this.gameState.status !== "playing" || this.gameState.pendingAction) return;
+
+    const current = getCurrentPlayer(this.gameState);
+    if (!current) return;
+
+    this.log.info({ username: current.username }, "Turn timeout — forcing draw");
+
+    if (current.isLocked) {
+      const newPlayers = new Map(this.gameState.players);
+      newPlayers.set(current.sessionId, { ...current, isLocked: false });
+      this.gameState = { ...this.gameState, players: newPlayers };
+    }
+
+    const result = drawCard(this.gameState, current.sessionId);
+    this.gameState = result.state;
+    this.broadcastState();
+    this.sendHandUpdate(current.sessionId);
+
+    // Kalau drawCard menghasilkan WATER_BUCKET_PLACE pending (timeout terjadi
+    // tepat saat draw Lava Cat dengan Water Bucket di tangan), selesaikan
+    // otomatis dengan posisi acak — sama seperti auto-play, supaya giliran
+    // tidak macet menunggu input yang sudah jelas tidak akan datang sebelum
+    // timeout berikutnya.
+    if (
+      this.gameState.pendingAction?.type === "WATER_BUCKET_PLACE" &&
+      this.gameState.pendingAction.initiatorId === current.sessionId
+    ) {
+      const lavaCatCard = this.gameState.pendingAction.data?.lavaCatCard as Card;
+      const randomPosition = Math.floor(Math.random() * (this.gameState.deck.length + 1));
+      this.gameState = placeLavaCat(this.gameState, lavaCatCard, randomPosition);
+      this.broadcastState();
+    }
+
+    this.refreshTurnState();
+  }
+
   private handleWaterBucket(client: Client, insertPosition: number) {
     const pa = this.gameState.pendingAction;
     if (!pa || pa.type !== "WATER_BUCKET_PLACE") throw new Error("Tidak ada Water Bucket pending!");
@@ -546,7 +679,7 @@ export class VolcanoCatsRoom extends Room {
     const lavaCatCard = pa.data?.lavaCatCard as Card;
     this.gameState = placeLavaCat(this.gameState, lavaCatCard, insertPosition);
     this.broadcastState();
-    this.triggerAutoPlayLoop();
+    this.refreshTurnState();
   }
 
   private handleBribeGive(client: Client, cardId: string) {
@@ -558,6 +691,7 @@ export class VolcanoCatsRoom extends Room {
     this.broadcastState();
     this.sendHandUpdate(pa.initiatorId);
     this.sendHandUpdate(client.sessionId);
+    this.refreshTurnState();
   }
 
   private handlePeekSwap(client: Client, doSwap: boolean, cardId?: string) {
@@ -568,6 +702,7 @@ export class VolcanoCatsRoom extends Room {
     this.gameState = resolvePeekAndSwap(this.gameState, client.sessionId, doSwap, cardId);
     this.broadcastState();
     this.sendHandUpdate(client.sessionId);
+    this.refreshTurnState();
   }
 
   private handleFloodDiscard(client: Client, cardId: string) {
@@ -588,6 +723,7 @@ export class VolcanoCatsRoom extends Room {
 
     this.broadcastState();
     this.sendHandUpdate(client.sessionId);
+    this.refreshTurnState();
   }
 
   private handleFreeze(client: Client) {
@@ -599,6 +735,11 @@ export class VolcanoCatsRoom extends Room {
     this.clearFreezeWindowTimer(); // efek yang ditahan sudah dibatalkan, jangan biarkan timer lama nyangkut
     this.broadcastState();
     this.sendHandUpdate(client.sessionId);
+
+    // Giliran masih milik initiator kartu yang di-Freeze (efeknya batal, tapi
+    // mereka belum draw/selesai giliran) — pasang ulang turn timer untuk
+    // mereka, karena waktu efektif sudah berkurang selama freeze window tadi.
+    this.refreshTurnState();
   }
 
   // ============================================================

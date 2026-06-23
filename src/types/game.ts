@@ -98,6 +98,11 @@ export interface GameState {
 
   winner: string | null;
   log: GameLogEntry[];
+
+  // Timestamp (epoch ms) kapan giliran sekarang akan timeout dan auto-draw
+  // dipaksa oleh server. null kalau tidak ada timer aktif (mis. status bukan
+  // "playing", atau sedang ada pendingAction yang menunggu input pemain lain).
+  turnEndsAt: number | null;
 }
 
 // ============================================================
@@ -157,4 +162,5 @@ export interface ClientGameState {
   pendingAction: PendingAction | null;
   winner: string | null;
   log: GameLogEntry[];
+  turnEndsAt: number | null;
 }

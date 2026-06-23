@@ -164,6 +164,10 @@ export function setupGame(state: GameState): GameState {
     pendingAction: null,
     peekResult: null,
     log: [addLog("Game dimulai! Semua pemain mendapat 6 kartu + 1 Water Bucket.", "system")],
+    // Timer giliran diatur oleh room (lihat handleStartGame) setelah fungsi
+    // ini selesai — room yang paling tahu kapan harus mulai/reset timer
+    // karena itu bersinggungan dengan Colyseus clock, bukan pure game logic.
+    turnEndsAt: null,
   };
 }
 
@@ -228,14 +232,22 @@ export function drawCard(state: GameState, playerId: string): {
     if (player.hasBunker) {
       const newPlayers = new Map(state.players);
       newPlayers.set(playerId, { ...player, hasBunker: false });
-      const newDiscard = [...state.discardPile, drawnCard];
+
+      // PENTING: Lava Cat TIDAK PERNAH masuk discard pile — itu akan mengurangi
+      // jumlah Lava Cat yang seharusnya tetap (playerCount - 1) beredar di deck
+      // selama game berlangsung. Bunker melindungi pemain dari ledakan, tapi
+      // Lava Cat-nya sendiri harus tetap kembali ke deck di posisi acak,
+      // sama seperti efek Water Bucket.
+      const deckWithLavaBack = [...newDeck];
+      const randomPosition = Math.floor(Math.random() * (deckWithLavaBack.length + 1));
+      deckWithLavaBack.splice(randomPosition, 0, drawnCard);
+
       return {
         state: {
           ...state,
-          deck: newDeck,
-          discardPile: newDiscard,
+          deck: deckWithLavaBack,
           players: newPlayers,
-          log: [...state.log, addLog(`${player.username} kena Lava Cat! Tapi Bunker melindungi mereka! 🛡️`, "action")],
+          log: [...state.log, addLog(`${player.username} kena Lava Cat! Tapi Bunker melindungi mereka! 🛡️ Lava Cat ditaruh balik ke deck.`, "action")],
         },
         drawnCard,
         exploded: false,
@@ -970,6 +982,15 @@ export function resolveFloodDiscard(state: GameState, playerId: string, cardId: 
   if (cardIdx === -1) throw new Error("Kartu tidak ditemukan!");
 
   const card = player.hand[cardIdx];
+  // Defense in depth: Lava Cat seharusnya tidak pernah ada di tangan pemain
+  // (selalu langsung diproses begitu di-draw), tapi kalau suatu saat ada bug
+  // lain yang membuatnya nyasar ke hand, JANGAN biarkan itu kebuang ke
+  // discard pile — itu akan mengurangi jumlah Lava Cat yang seharusnya tetap
+  // beredar (playerCount - 1) selama game.
+  if (card.type === "LAVA_CAT") {
+    throw new Error("Lava Cat tidak bisa dibuang lewat Flood!");
+  }
+
   const newPlayers = new Map(state.players);
   newPlayers.set(playerId, { ...player, hand: player.hand.filter((_, i) => i !== cardIdx) });
 
@@ -1160,6 +1181,7 @@ export function serializeForClient(state: GameState, viewerId?: string): ClientG
     pendingAction: state.pendingAction,
     winner: state.winner,
     log: state.log.slice(-30), // kirim 30 log terakhir
+    turnEndsAt: state.turnEndsAt,
   };
 }
 
