@@ -233,22 +233,21 @@ export function drawCard(state: GameState, playerId: string): {
       const newPlayers = new Map(state.players);
       newPlayers.set(playerId, { ...player, hasBunker: false });
 
-      // PENTING: Lava Cat TIDAK PERNAH masuk discard pile — itu akan mengurangi
-      // jumlah Lava Cat yang seharusnya tetap (playerCount - 1) beredar di deck
-      // selama game berlangsung. Bunker melindungi pemain dari ledakan, tapi
-      // Lava Cat-nya sendiri harus tetap kembali ke deck di posisi acak,
-      // sama seperti efek Water Bucket.
       const deckWithLavaBack = [...newDeck];
       const randomPosition = Math.floor(Math.random() * (deckWithLavaBack.length + 1));
       deckWithLavaBack.splice(randomPosition, 0, drawnCard);
 
+      // PENTING: harus advance turn di sini, sama seperti draw kartu normal.
+      // Tanpa ini giliran macet setelah Bunker melindungi pemain.
+      const stateAfterBunker: GameState = {
+        ...state,
+        deck: deckWithLavaBack,
+        players: newPlayers,
+        log: [...state.log, addLog(`${player.username} kena Lava Cat! Tapi Bunker melindungi! 🛡️ Lava Cat kembali ke deck secara acak.`, "action")],
+      };
+
       return {
-        state: {
-          ...state,
-          deck: deckWithLavaBack,
-          players: newPlayers,
-          log: [...state.log, addLog(`${player.username} kena Lava Cat! Tapi Bunker melindungi mereka! 🛡️ Lava Cat ditaruh balik ke deck.`, "action")],
-        },
+        state: advanceTurn(stateAfterBunker),
         drawnCard,
         exploded: false,
       };
@@ -930,17 +929,6 @@ function applyPickpocket(state: GameState, playerId: string, targetId: string): 
   const target = state.players.get(targetId)!;
   if (!target.isAlive || target.hand.length === 0) throw new Error("Target tidak valid!");
 
-  // Cek bunker target
-  if (target.hasBunker) {
-    const newPlayers = new Map(state.players);
-    newPlayers.set(targetId, { ...target, hasBunker: false });
-    return {
-      ...state,
-      players: newPlayers,
-      log: [...state.log, addLog(`${player.username} Pickpocket ${target.username} tapi Bunker melindungi! 🛡️`, "action")],
-    };
-  }
-
   const randIdx = Math.floor(Math.random() * target.hand.length);
   const stolenCard = target.hand[randIdx];
   const newTargetHand = target.hand.filter((_, i) => i !== randIdx);
@@ -1051,17 +1039,6 @@ function applyLockdown(state: GameState, playerId: string, targetId: string): Ga
   const player = state.players.get(playerId)!;
   const target = state.players.get(targetId)!;
   if (!target.isAlive) throw new Error("Target sudah mati!");
-
-  // Cek bunker
-  if (target.hasBunker) {
-    const newPlayers = new Map(state.players);
-    newPlayers.set(targetId, { ...target, hasBunker: false });
-    return {
-      ...state,
-      players: newPlayers,
-      log: [...state.log, addLog(`${player.username} Lockdown ${target.username} tapi Bunker melindungi! 🛡️`, "action")],
-    };
-  }
 
   const newPlayers = new Map(state.players);
   newPlayers.set(targetId, { ...target, isLocked: true });

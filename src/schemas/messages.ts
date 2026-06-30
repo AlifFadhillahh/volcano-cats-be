@@ -47,6 +47,10 @@ export const toggleAwaySchema = z.object({
   away: z.boolean(),
 });
 
+export const kickPlayerSchema = z.object({
+  targetSessionId: sessionIdSchema,
+});
+
 export const joinOptionsSchema = z.object({
   username: z.string().trim().min(1).max(20).optional(),
 });
@@ -65,6 +69,7 @@ export const MESSAGE_SCHEMAS = {
   FLOOD_DISCARD: floodDiscardSchema,
   FREEZE_PLAY: freezePlaySchema,
   TOGGLE_AWAY: toggleAwaySchema,
+  KICK_PLAYER: kickPlayerSchema,
 } as const;
 
 export type MessageType = keyof typeof MESSAGE_SCHEMAS;

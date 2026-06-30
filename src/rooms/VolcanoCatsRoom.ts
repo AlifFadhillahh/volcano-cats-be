@@ -323,6 +323,11 @@ export class VolcanoCatsRoom extends Room {
           this.handleToggleAway(client, data.away);
           break;
         }
+        case "KICK_PLAYER": {
+          const data = result.data as { targetSessionId: string };
+          this.handleKickPlayer(client, data.targetSessionId);
+          break;
+        }
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -376,6 +381,47 @@ export class VolcanoCatsRoom extends Room {
     // Sebaliknya kalau away=false dan ternyata gilirannya sekarang, turn timer
     // baru perlu dipasang (karena sebelumnya tidak aktif selama away=true).
     this.refreshTurnState();
+  }
+
+  private handleKickPlayer(client: Client, targetSessionId: string) {
+    // Hanya host yang boleh kick
+    if (client.sessionId !== this.gameState.hostId) {
+      throw new Error("Hanya host yang bisa kick pemain!");
+    }
+    // Hanya bisa kick saat lobby
+    if (this.gameState.status !== "lobby") {
+      throw new Error("Tidak bisa kick pemain setelah game dimulai!");
+    }
+    // Host tidak bisa kick dirinya sendiri
+    if (targetSessionId === client.sessionId) {
+      throw new Error("Tidak bisa kick dirimu sendiri!");
+    }
+
+    const target = this.gameState.players.get(targetSessionId);
+    if (!target) throw new Error("Pemain tidak ditemukan!");
+
+    // Kirim notifikasi ke target sebelum disconnect
+    const targetClient = this.clients.find(c => c.sessionId === targetSessionId);
+    if (targetClient) {
+      this.sendToClient(targetClient, {
+        type: "ERROR",
+        message: "Kamu telah di-kick dari room oleh host.",
+      });
+      // Kode 4002 = kicked
+      targetClient.leave(4002);
+    }
+
+    // Hapus dari state
+    const newPlayers = new Map(this.gameState.players);
+    newPlayers.delete(targetSessionId);
+    this.gameState = {
+      ...this.gameState,
+      players: newPlayers,
+      turnOrder: this.gameState.turnOrder.filter(id => id !== targetSessionId),
+    };
+
+    this.log.info({ kicked: target.username, by: this.gameState.players.get(client.sessionId)?.username }, "Player kicked");
+    this.broadcastState();
   }
 
   private handleDrawCard(client: Client) {

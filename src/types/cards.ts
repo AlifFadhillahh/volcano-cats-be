@@ -135,7 +135,7 @@ export const CARD_DEFINITIONS: CardDefinition[] = [
     type: "BUNKER",
     name: "Bunker",
     emoji: "🛡️",
-    description: "Pasang di depanmu. Batalkan efek negatif pertama yang kamu terima, lalu Bunker hancur.",
+    description: "Melindungi dari Lava Cat SAJA. Jika kamu draw Lava Cat, Bunker hancur dan Lava Cat kembali ke deck secara acak. TIDAK melindungi dari Sniper, Pickpocket, Flood, dll.",
     count: 4,
   },
   {
